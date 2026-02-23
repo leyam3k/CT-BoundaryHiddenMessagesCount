@@ -1,515 +1,393 @@
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
+import { delay } from "../../../utils.js";
 
-const extensionName = "SillyTavern-Ghostfinder";
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
-const extensionDisplayName = "Ghostfinder";
+const MODULE_NAME = 'CT-BoundaryHiddenMessagesCount';
+const extensionFolderPath = `scripts/extensions/third-party/${MODULE_NAME}`;
 
-// Helper for debug logging
-function log(...args) {
-    if (extension_settings[extensionName]?.debugMode) {
-        console.log(`[${extensionDisplayName}]`, ...args);
+// Initialize the extension
+const init = () => {
+    const leftSendForm = document.getElementById('leftSendForm');
+    if (!leftSendForm) {
+        console.error(`[${MODULE_NAME}] Could not find #leftSendForm element`);
+        return;
     }
-}
 
-// Helper for regular logging
-function info(...args) {
-    console.log(`[${extensionDisplayName}]`, ...args);
-}
-
-// Default settings
-const defaultSettings = { 
-    enabled: true,
-    showIndex: false,
-    findEnd: false,
-    debugMode: false
-};
-
-// Initialize settings
-function loadSettings() {
-    // Initialize with defaults if doesn't exist
-    if (!extension_settings[extensionName]) {
-        extension_settings[extensionName] = structuredClone(defaultSettings);
-    }
-    
-    // Ensure all settings exist
-    if (extension_settings[extensionName].enabled === undefined) {
-        extension_settings[extensionName].enabled = true;
-    }
-    
-    if (extension_settings[extensionName].showIndex === undefined) {
-        extension_settings[extensionName].showIndex = false;
-    }
-    
-    if (extension_settings[extensionName].findEnd === undefined) {
-        extension_settings[extensionName].findEnd = false;
-    }
-    
-    if (extension_settings[extensionName].debugMode === undefined) {
-        extension_settings[extensionName].debugMode = false;
-    }
-    
-    // Update UI if it exists
-    const enabledCheckbox = document.querySelector('#ghostfinder_enabled');
-    if (enabledCheckbox) {
-        enabledCheckbox.checked = extension_settings[extensionName].enabled;
-    }
-    
-    const showIndexCheckbox = document.querySelector('#ghostfinder_show_index');
-    if (showIndexCheckbox) {
-        showIndexCheckbox.checked = extension_settings[extensionName].showIndex;
-    }
-    
-    const findEndCheckbox = document.querySelector('#ghostfinder_find_end');
-    if (findEndCheckbox) {
-        findEndCheckbox.checked = extension_settings[extensionName].findEnd;
-    }
-    
-    const debugCheckbox = document.querySelector('#ghostfinder_debug');
-    if (debugCheckbox) {
-        debugCheckbox.checked = extension_settings[extensionName].debugMode;
-    }
-    
-    log("Settings loaded:", extension_settings[extensionName]);
-}
-
-// Find ALL boundary messages from context.chat (includes unloaded)
-function findAllBoundaries() {
-    const context = getContext();
-    const allMessages = context.chat || [];
-    const boundaries = [];
-    const findEnd = extension_settings[extensionName].findEnd;
-    let lastWasHidden = false;
-    
-    for (let i = 0; i < allMessages.length; i++) {
-        const msg = allMessages[i];
-        const isHidden = msg.is_system === true;
-        
-        if (findEnd) {
-            // Find LAST unhidden before hidden section (end of boundary)
-            if (isHidden && !lastWasHidden && i > 0) {
-                boundaries.push(i - 1);
+    // Create trigger button with ghost icon
+    const trigger = document.createElement('div');
+    {
+        trigger.id = 'ctbhmc--trigger';
+        trigger.classList.add('ctbhmc--trigger');
+        trigger.classList.add('fa-solid', 'fa-fw', 'fa-ghost');
+        trigger.classList.add('interactable');
+        trigger.tabIndex = 0;
+        trigger.title = 'Hidden Messages Overview';
+        trigger.addEventListener('click', () => {
+            panel.classList.toggle('ctbhmc--isActive');
+            if (panel.classList.contains('ctbhmc--isActive')) {
+                updatePanel();
             }
-        } else {
-            // Find FIRST unhidden after hidden section (start of boundary)
+        });
+        leftSendForm.append(trigger);
+    }
+
+    // Create panel for displaying messages list
+    const panel = document.createElement('div');
+    {
+        panel.id = 'ctbhmc--panel';
+        panel.classList.add('ctbhmc--panel');
+        panel.innerHTML = 'Loading...';
+        document.body.append(panel);
+    }
+
+    let currentBadgeValue = '';
+    let isUpdating = false;
+
+    /**
+     * Get all hidden messages except System Instruction messages
+     * @returns {{hiddenMessages: Array, boundaries: Array, totalCount: number}}
+     */
+    const getHiddenMessagesData = () => {
+        const context = getContext();
+        const allMessages = context.chat || [];
+        const hiddenMessages = [];
+        const boundaries = [];
+        let lastWasHidden = false;
+
+        for (let i = 0; i < allMessages.length; i++) {
+            const msg = allMessages[i];
+            const isHidden = msg.is_system === true;
+            
+            // Check if it's a System Instruction message (exclude from count)
+            const isSystemInstruction = isHidden && 
+                msg.name === 'Instruction' && 
+                msg.extra?.type === 'narrator';
+
+            if (isHidden && !isSystemInstruction) {
+                hiddenMessages.push(i);
+            }
+
+            // Track boundaries (first unhidden after hidden section)
             if (!isHidden && lastWasHidden) {
                 boundaries.push(i);
             }
+
+            lastWasHidden = isHidden;
         }
-        
-        lastWasHidden = isHidden;
-    }
-    
-    log(`Found ${boundaries.length} boundaries (${findEnd ? 'ends' : 'starts'}):`, boundaries);
-    return boundaries;
-}
 
-// Find the next boundary before current scroll position
-function findNextBoundary() {
-    const boundaries = findAllBoundaries();
-    
-    if (boundaries.length === 0) {
-        return null;
-    }
-    
-    const scrollTop = $('#chat').scrollTop();
-    const chatTop = $('#chat').offset().top;
-    
-    let currentMesId = null;
-    $('#chat .mes').each(function() {
-        const messageTop = $(this).offset().top - chatTop + scrollTop;
-        if (messageTop >= scrollTop - 10) {
-            currentMesId = parseInt($(this).attr('mesid'));
-            return false;
-        }
-    });
-    
-    if (currentMesId === null) {
-        return boundaries[boundaries.length - 1];
-    }
-    
-    for (let i = boundaries.length - 1; i >= 0; i--) {
-        if (boundaries[i] < currentMesId) {
-            return boundaries[i];
-        }
-    }
-    
-    return null;
-}
-
-// Jump to a specific boundary message
-function jumpToBoundary(mesId) {
-    if (mesId === null || mesId === undefined) {
-        toastr.info('No boundary found', extensionDisplayName);
-        return;
-    }
-    
-    const targetElement = $(`.mes[mesid="${mesId}"]`);
-    
-    if (targetElement.length > 0) {
-        targetElement[0].scrollIntoView({ behavior: 'smooth', block: 'start' });
-        toastr.success(`Jumped to message #${mesId}`, extensionDisplayName);
-        log(`Jumped to message #${mesId}`);
-    } else {
-        // Message not loaded - scroll to top to load more messages
-        $('#chat').animate({ scrollTop: 0 }, 'smooth');
-        toastr.info(`Message #${mesId} not loaded. Scrolled to top - click "Show More Messages" to load earlier messages.`, extensionDisplayName);
-        log(`Message #${mesId} not loaded, scrolled to top`);
-    }
-}
-
-// Update the sidebar panel with boundary list
-function updateSidebarPanel() {
-    const boundaries = findAllBoundaries();
-    const listContainer = $('#ghostfinder_sidebar_list');
-    
-    if (listContainer.length === 0) {
-        log("Sidebar list container not found");
-        return;
-    }
-    
-    listContainer.empty();
-    
-    if (boundaries.length === 0) {
-        listContainer.append('<div class="ghostfinder_no_boundaries">No boundaries found</div>');
-        log("No boundaries found");
-        return;
-    }
-    
-    log(`Updating sidebar with ${boundaries.length} boundaries`);
-    
-    boundaries.forEach(mesId => {
-        const item = $('<div class="ghostfinder_boundary_item menu_button"></div>');
-        const ghostIcon = $('<i class="fa-solid fa-ghost ghostfinder_ghost_icon"></i>');
-        const text = $('<span></span>').text(`Message #${mesId}`);
-        
-        item.append(ghostIcon).append(text);
-        item.on('click', () => jumpToBoundary(mesId));
-        listContainer.append(item);
-    });
-}
-
-// Toggle sidebar panel
-function toggleSidebar() {
-    const sidebar = $('#ghostfinder_sidebar');
-    
-    if (sidebar.hasClass('ghostfinder_open')) {
-        sidebar.removeClass('ghostfinder_open');
-        log("Sidebar closed");
-    } else {
-        updateSidebarPanel();
-        sidebar.addClass('ghostfinder_open');
-        log("Sidebar opened");
-    }
-}
-
-// Close sidebar
-function closeSidebar() {
-    $('#ghostfinder_sidebar').removeClass('ghostfinder_open');
-    log("Sidebar closed");
-}
-
-// Open sidebar panel (for Extensions menu button)
-function openSidebar() {
-    updateSidebarPanel();
-    $('#ghostfinder_sidebar').addClass('ghostfinder_open');
-    log("Sidebar opened from menu");
-}
-
-// Handle lantern button click
-function onLanternClick() {
-    log("Lantern button clicked");
-    
-    // If showIndex is enabled, toggle sidebar instead of jumping
-    if (extension_settings[extensionName].showIndex) {
-        toggleSidebar();
-    } else {
-        const nextBoundary = findNextBoundary();
-        jumpToBoundary(nextBoundary);
-    }
-}
-
-// Add Extensions menu button
-function addExtensionsMenuButton() {
-    // Remove existing button
-    $('#ghostfinder_menu_button').remove();
-    
-    // Select the Extensions dropdown menu
-    const $extensions_menu = $('#extensionsMenu');
-    if (!$extensions_menu.length) {
-        log("Extensions menu not found");
-        return;
-    }
-    
-    // Create button element
-    const $button = $(`
-        <div id="ghostfinder_menu_button" class="list-group-item flex-container flexGap5 interactable" title="Show Boundary Index" tabindex="0">
-            <i class="fa-solid fa-ghost"></i>
-            <span>Show Boundary Index</span>
-        </div>
-    `);
-    
-    // Append to extensions menu
-    $button.appendTo($extensions_menu);
-    
-    // Set click handler
-    $button.on('click', openSidebar);
-    
-    log("Menu button added to Extensions dropdown");
-}
-
-// Add lantern button to chat interface
-function addLanternButton() {
-    if (!extension_settings[extensionName].enabled) {
-        $('#ghostfinder_button').remove();
-        log("Lantern button removed (extension disabled)");
-        return;
-    }
-    
-    if ($('#ghostfinder_button').length > 0) {
-        log("Lantern button already exists");
-        return;
-    }
-    
-    const findEnd = extension_settings[extensionName].findEnd;
-    const tooltipText = findEnd ? 'Find last message before hidden sections' : 'Find previous boundary';
-    
-    const button = $(`
-        <div id="ghostfinder_button" class="interactable" title="${tooltipText}" tabindex="0" role="button">
-            <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 2 C 9 2, 7 3.5, 7 5 L 7 6 L 17 6 L 17 5 C 17 3.5, 15 2, 12 2 Z"/>
-                <path d="M 8 6 L 6 10 C 6 10, 5.5 13, 5.5 15 C 5.5 17, 6 18, 7 19 L 17 19 C 18 18, 18.5 17, 18.5 15 C 18.5 13, 18 10, 18 10 L 16 6 Z"/>
-                <path d="M 12 10 C 12 10, 10.5 12, 10.5 14 C 10.5 15.5, 11.2 16.5, 12 16.5 C 12.8 16.5, 13.5 15.5, 13.5 14 C 13.5 12, 12 10, 12 10 Z"/>
-                <path d="M 12 11.5 C 12 11.5, 11.2 12.8, 11.2 13.8 C 11.2 14.5, 11.5 15, 12 15 C 12.5 15, 12.8 14.5, 12.8 13.8 C 12.8 12.8, 12 11.5, 12 11.5 Z"/>
-                <rect x="7" y="19" width="10" height="3" rx="1"/>
-                <circle cx="18.5" cy="20.5" r="1"/>
-                <line x1="17.5" y1="20.5" x2="19.5" y2="20.5"/>
-            </svg>
-        </div>
-    `);
-    button.on('click', onLanternClick);
-    
-    $('#rightSendForm').prepend(button);
-    
-    log("Lantern button added");
-}
-
-// Create sidebar panel
-function createSidebar() {
-    // Check if sidebar is currently open before removing
-    const wasOpen = $('#ghostfinder_sidebar').hasClass('ghostfinder_open');
-    
-    // Remove existing sidebar if any
-    $('#ghostfinder_sidebar').remove();
-    
-    const findEnd = extension_settings[extensionName].findEnd;
-    const headerText = findEnd ? 'Last Messages Before Hidden' : 'First Messages After Hidden';
-    
-    const sidebar = $(`
-        <div id="ghostfinder_sidebar" class="ghostfinder_sidebar ${wasOpen ? 'ghostfinder_open' : ''}">
-            <div class="ghostfinder_sidebar_header">
-                <div>
-                    <h3>Boundary Messages</h3>
-                    <small class="ghostfinder_mode_text">${headerText}</small>
-                </div>
-                <div class="ghostfinder_sidebar_controls">
-                    <div id="ghostfinder_sidebar_refresh" class="fa-solid fa-rotate interactable" title="Refresh"></div>
-                    <div id="ghostfinder_sidebar_close" class="fa-solid fa-circle-xmark interactable" title="Close"></div>
-                </div>
-            </div>
-            <div id="ghostfinder_sidebar_list" class="ghostfinder_sidebar_list"></div>
-        </div>
-    `);
-    
-    $('body').append(sidebar);
-    
-    $('#ghostfinder_sidebar_close').on('click', closeSidebar);
-    $('#ghostfinder_sidebar_refresh').on('click', updateSidebarPanel);
-    
-    // If it was open, update the panel content
-    if (wasOpen) {
-        updateSidebarPanel();
-    }
-    
-    log("Sidebar created");
-}
-
-// Setup event listeners for chat changes
-function setupEventListeners() {
-    log("Registering event listeners");
-    
-    // Update when chat changes
-    eventSource.on(event_types.CHAT_CHANGED, () => {
-        log("CHAT_CHANGED event");
-        updateSidebarPanel();
-    });
-    
-    eventSource.on(event_types.MESSAGE_RECEIVED, () => {
-        log("MESSAGE_RECEIVED event");
-        updateSidebarPanel();
-    });
-    
-    eventSource.on(event_types.MESSAGE_DELETED, () => {
-        log("MESSAGE_DELETED event");
-        updateSidebarPanel();
-    });
-    
-    eventSource.on(event_types.MESSAGE_EDITED, () => {
-        log("MESSAGE_EDITED event");
-        updateSidebarPanel();
-    });
-    
-    eventSource.on(event_types.MESSAGE_UPDATED, () => {
-        log("MESSAGE_UPDATED event");
-        updateSidebarPanel();
-    });
-    
-    eventSource.on(event_types.MESSAGE_SWIPED, () => {
-        log("MESSAGE_SWIPED event");
-        updateSidebarPanel();
-    });
-    
-    eventSource.on(event_types.CHAT_UPDATED, () => {
-        log("CHAT_UPDATED event");
-        updateSidebarPanel();
-    });
-}
-
-// Add MutationObserver to detect hide/unhide operations
-function setupHideUnhideObserver() {
-    const chatContainer = document.getElementById('chat');
-    if (!chatContainer) {
-        log("Chat container not found for observer");
-        return;
-    }
-    
-    // Debounce the update to avoid excessive calls
-    let updateTimeout;
-    const debouncedUpdate = () => {
-        clearTimeout(updateTimeout);
-        updateTimeout = setTimeout(() => {
-            log("Detected hide/unhide operation");
-            updateSidebarPanel();
-        }, 100);
+        return {
+            hiddenMessages,
+            boundaries,
+            totalCount: hiddenMessages.length
+        };
     };
-    
-    const observer = new MutationObserver((mutations) => {
-        for (const mutation of mutations) {
-            // Check if is_system attribute changed on any message
-            if (mutation.type === 'attributes' && 
-                mutation.attributeName === 'is_system' &&
-                mutation.target.classList.contains('mes')) {
-                debouncedUpdate();
-                break;
+
+    /**
+     * Group consecutive message IDs into ranges
+     * @param {Array<number>} messageIds
+     * @returns {Array<{start: number, end: number}>}
+     */
+    const groupIntoRanges = (messageIds) => {
+        if (messageIds.length === 0) return [];
+        
+        const ranges = [];
+        let rangeStart = messageIds[0];
+        let rangeEnd = messageIds[0];
+
+        for (let i = 1; i < messageIds.length; i++) {
+            if (messageIds[i] === rangeEnd + 1) {
+                rangeEnd = messageIds[i];
+            } else {
+                ranges.push({ start: rangeStart, end: rangeEnd });
+                rangeStart = messageIds[i];
+                rangeEnd = messageIds[i];
             }
         }
+        ranges.push({ start: rangeStart, end: rangeEnd });
+        
+        return ranges;
+    };
+
+    /**
+     * Navigate to a specific message
+     * @param {number} mesId Message ID
+     * @param {string} position 'start' or 'end' for ranges
+     */
+    const navigateToMessage = (mesId, position = 'start') => {
+        const targetElement = $(`.mes[mesid="${mesId}"]`);
+        
+        if (targetElement.length > 0) {
+            targetElement[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+            
+            // Highlight briefly
+            targetElement.addClass('ctbhmc--highlight');
+            setTimeout(() => {
+                targetElement.removeClass('ctbhmc--highlight');
+            }, 2000);
+            
+            toastr.success(`Navigated to message #${mesId}`, MODULE_NAME);
+        } else {
+            // Message not loaded - scroll to top to load more messages
+            $('#chat').animate({ scrollTop: 0 }, 'smooth');
+            toastr.info(`Message #${mesId} not loaded. Scroll to top and click "Show More Messages" to load earlier messages.`, MODULE_NAME);
+        }
+    };
+
+    /**
+     * Create a message entry element
+     * @param {number|Object} messageData Message ID or range object
+     * @param {boolean} isRange Whether this is a range
+     * @returns {HTMLElement}
+     */
+    const createMessageEntry = (messageData, isRange = false) => {
+        const entry = document.createElement('div');
+        entry.classList.add('ctbhmc--entry');
+
+        if (isRange) {
+            const { start, end } = messageData;
+            const text = document.createElement('span');
+            text.textContent = `Messages #${start} - #${end}`;
+            entry.appendChild(text);
+
+            const navButtons = document.createElement('div');
+            navButtons.classList.add('ctbhmc--nav-buttons');
+
+            const startBtn = document.createElement('button');
+            startBtn.classList.add('ctbhmc--nav-btn', 'menu_button');
+            startBtn.innerHTML = '<i class="fa-solid fa-arrow-left"></i> Start';
+            startBtn.title = `Navigate to message #${start}`;
+            startBtn.addEventListener('click', () => navigateToMessage(start, 'start'));
+
+            const endBtn = document.createElement('button');
+            endBtn.classList.add('ctbhmc--nav-btn', 'menu_button');
+            endBtn.innerHTML = 'End <i class="fa-solid fa-arrow-right"></i>';
+            endBtn.title = `Navigate to message #${end}`;
+            endBtn.addEventListener('click', () => navigateToMessage(end, 'end'));
+
+            navButtons.appendChild(startBtn);
+            navButtons.appendChild(endBtn);
+            entry.appendChild(navButtons);
+        } else {
+            // Get message content for preview
+            const context = getContext();
+            const message = context.chat[messageData];
+            const messageContent = message?.mes || '';
+            const preview = messageContent.substring(0, 50) + (messageContent.length > 50 ? '...' : '');
+            
+            const messageInfo = document.createElement('div');
+            messageInfo.classList.add('ctbhmc--message-info');
+            
+            const messageNumber = document.createElement('div');
+            messageNumber.classList.add('ctbhmc--message-number');
+            messageNumber.textContent = `#${messageData}`;
+            
+            const messagePreview = document.createElement('div');
+            messagePreview.classList.add('ctbhmc--message-preview');
+            messagePreview.textContent = preview;
+            messagePreview.title = messageContent;
+            
+            messageInfo.appendChild(messageNumber);
+            messageInfo.appendChild(messagePreview);
+            entry.appendChild(messageInfo);
+
+            const navBtn = document.createElement('button');
+            navBtn.classList.add('ctbhmc--nav-btn', 'menu_button');
+            navBtn.innerHTML = '<i class="fa-solid fa-location-arrow"></i>';
+            navBtn.title = `Navigate to message #${messageData}`;
+            navBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                navigateToMessage(messageData);
+            });
+            entry.appendChild(navBtn);
+            
+            // Make entire entry clickable
+            entry.addEventListener('click', () => navigateToMessage(messageData));
+        }
+
+        return entry;
+    };
+
+    /**
+     * Update the badge label with animations
+     * @param {string} newValue - New string to display
+     */
+    const updateBadge = async (newValue) => {
+        if (isUpdating) return;
+        isUpdating = true;
+
+        try {
+            const isNoMessages = newValue === '0' || newValue === '';
+            
+            if (currentBadgeValue !== newValue) {
+                if (isNoMessages) {
+                    trigger.classList.add('ctbhmc--badge-out');
+                    await delay(510);
+                    trigger.setAttribute('data-ctbhmc--badge-count', newValue);
+                    trigger.classList.remove('ctbhmc--badge-out');
+                } else if (currentBadgeValue === '' || currentBadgeValue === '0') {
+                    trigger.setAttribute('data-ctbhmc--badge-count', newValue);
+                    trigger.classList.add('ctbhmc--badge-in');
+                    await delay(510);
+                    trigger.classList.remove('ctbhmc--badge-in');
+                } else {
+                    trigger.setAttribute('data-ctbhmc--badge-count', newValue);
+                    trigger.classList.add('ctbhmc--badge-bounce');
+                    await delay(1010);
+                    trigger.classList.remove('ctbhmc--badge-bounce');
+                }
+                currentBadgeValue = newValue;
+            }
+        } finally {
+            isUpdating = false;
+        }
+    };
+
+    /**
+     * Update the panel content
+     */
+    const updatePanel = () => {
+        const data = getHiddenMessagesData();
+        panel.innerHTML = '';
+
+        // Hidden Messages Section
+        const hiddenSection = document.createElement('div');
+        hiddenSection.classList.add('ctbhmc--section');
+
+        const hiddenHeader = document.createElement('div');
+        hiddenHeader.classList.add('ctbhmc--section-header');
+        hiddenHeader.textContent = 'Hidden Messages';
+        hiddenSection.appendChild(hiddenHeader);
+
+        if (data.hiddenMessages.length === 0) {
+            const empty = document.createElement('div');
+            empty.classList.add('ctbhmc--empty');
+            empty.textContent = 'No hidden messages';
+            hiddenSection.appendChild(empty);
+        } else {
+            const ranges = groupIntoRanges(data.hiddenMessages);
+            ranges.forEach(range => {
+                if (range.start === range.end) {
+                    hiddenSection.appendChild(createMessageEntry(range.start, false));
+                } else {
+                    hiddenSection.appendChild(createMessageEntry(range, true));
+                }
+            });
+        }
+
+        panel.appendChild(hiddenSection);
+
+        // Boundary Messages Section
+        const boundarySection = document.createElement('div');
+        boundarySection.classList.add('ctbhmc--section');
+
+        const boundaryHeader = document.createElement('div');
+        boundaryHeader.classList.add('ctbhmc--section-header');
+        boundaryHeader.textContent = 'Boundary Messages';
+        boundarySection.appendChild(boundaryHeader);
+
+        if (data.boundaries.length === 0) {
+            const empty = document.createElement('div');
+            empty.classList.add('ctbhmc--empty');
+            empty.textContent = 'No boundary messages';
+            boundarySection.appendChild(empty);
+        } else {
+            data.boundaries.forEach(mesId => {
+                boundarySection.appendChild(createMessageEntry(mesId, false));
+            });
+        }
+
+        panel.appendChild(boundarySection);
+
+        // Update badge
+        updateBadge(String(data.totalCount));
+
+        // Update trigger title
+        if (data.totalCount > 0) {
+            trigger.title = `Hidden Messages: ${data.totalCount}`;
+        } else {
+            trigger.title = 'Hidden Messages Overview';
+        }
+    };
+
+    /**
+     * Main update function
+     */
+    const updateCounter = () => {
+        const data = getHiddenMessagesData();
+        updateBadge(String(data.totalCount));
+
+        if (data.totalCount > 0) {
+            trigger.title = `Hidden Messages: ${data.totalCount}`;
+        } else {
+            trigger.title = 'Hidden Messages Overview';
+        }
+
+        if (panel.classList.contains('ctbhmc--isActive')) {
+            updatePanel();
+        }
+    };
+
+    // Close panel when clicking outside
+    document.addEventListener('click', (e) => {
+        if (!panel.contains(e.target) && !trigger.contains(e.target)) {
+            panel.classList.remove('ctbhmc--isActive');
+        }
     });
-    
-    observer.observe(chatContainer, {
-        attributes: true,
-        attributeFilter: ['is_system'],
-        subtree: true
+
+    // Setup MutationObserver to detect hide/unhide operations
+    const setupHideUnhideObserver = () => {
+        const chatContainer = document.getElementById('chat');
+        if (!chatContainer) {
+            console.warn(`[${MODULE_NAME}] Chat container not found for observer`);
+            return;
+        }
+
+        let updateTimeout;
+        const debouncedUpdate = () => {
+            clearTimeout(updateTimeout);
+            updateTimeout = setTimeout(() => {
+                updateCounter();
+            }, 100);
+        };
+
+        const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                if (mutation.type === 'attributes' && 
+                    mutation.attributeName === 'is_system' &&
+                    mutation.target.classList.contains('mes')) {
+                    debouncedUpdate();
+                    break;
+                }
+            }
+        });
+
+        observer.observe(chatContainer, {
+            attributes: true,
+            attributeFilter: ['is_system'],
+            subtree: true
+        });
+    };
+
+    // Register event listeners
+    eventSource.on(event_types.CHAT_CHANGED, () => updateCounter());
+    eventSource.on(event_types.MESSAGE_RECEIVED, () => updateCounter());
+    eventSource.on(event_types.MESSAGE_DELETED, () => updateCounter());
+    eventSource.on(event_types.MESSAGE_EDITED, () => updateCounter());
+    eventSource.on(event_types.MESSAGE_UPDATED, () => updateCounter());
+    eventSource.on(event_types.MESSAGE_SWIPED, () => updateCounter());
+    eventSource.on(event_types.CHAT_UPDATED, () => updateCounter());
+    eventSource.on(event_types.APP_READY, () => {
+        updateCounter();
+        setupHideUnhideObserver();
     });
-    
-    log("Hide/unhide observer started");
-}
 
-// Handle enabled toggle
-function onEnabledChange(event) {
-    const value = Boolean($(event.target).prop("checked"));
-    extension_settings[extensionName].enabled = value;
-    saveSettingsDebounced();
-    info(`Extension ${value ? 'enabled' : 'disabled'}`);
-    
-    addLanternButton();
-    addExtensionsMenuButton();
-    createSidebar();
-}
-
-// Handle show index toggle
-function onShowIndexChange(event) {
-    const value = Boolean($(event.target).prop("checked"));
-    extension_settings[extensionName].showIndex = value;
-    saveSettingsDebounced();
-    info(`Show index panel ${value ? 'enabled' : 'disabled'}`);
-    
-    createSidebar();
-    
-    // Update button tooltip
-    if (value) {
-        $('#ghostfinder_button').attr('title', 'Show boundary index');
-    } else {
-        const findEnd = extension_settings[extensionName].findEnd;
-        const tooltipText = findEnd ? 'Find last message before hidden sections' : 'Find previous boundary';
-        $('#ghostfinder_button').attr('title', tooltipText);
-    }
-}
-
-// Handle find end toggle
-function onFindEndChange(event) {
-    const value = Boolean($(event.target).prop("checked"));
-    extension_settings[extensionName].findEnd = value;
-    saveSettingsDebounced();
-    info(`Find end mode ${value ? 'enabled' : 'disabled'}`);
-    
-    updateSidebarPanel();
-    createSidebar();
-    
-    // Update button tooltip
-    const tooltipText = value ? 'Find last message before hidden sections' : 'Find previous boundary';
-    $('#ghostfinder_button').attr('title', tooltipText);
-}
-
-// Handle debug mode toggle
-function onDebugModeChange(event) {
-    const value = Boolean($(event.target).prop("checked"));
-    extension_settings[extensionName].debugMode = value;
-    saveSettingsDebounced();
-    info(`Debug mode ${value ? 'enabled' : 'disabled'}`);
-}
-
-// Initialize the extension
-async function init() {
-    info("Initializing...");
-    
-    loadSettings();
-    
-    // Load settings UI
-    try {
-        const settingsHtml = await $.get(`${extensionFolderPath}/settings.html`);
-        $("#extensions_settings2").append(settingsHtml);
-        
-        // Bind event handlers
-        $("#ghostfinder_enabled").on("change", onEnabledChange);
-        $("#ghostfinder_show_index").on("change", onShowIndexChange);
-        $("#ghostfinder_find_end").on("change", onFindEndChange);
-        $("#ghostfinder_debug").on("change", onDebugModeChange);
-        
-        // Update checkbox states
-        $("#ghostfinder_enabled").prop("checked", extension_settings[extensionName].enabled);
-        $("#ghostfinder_show_index").prop("checked", extension_settings[extensionName].showIndex);
-        $("#ghostfinder_find_end").prop("checked", extension_settings[extensionName].findEnd);
-        $("#ghostfinder_debug").prop("checked", extension_settings[extensionName].debugMode);
-        
-        log("Settings UI loaded");
-    } catch (error) {
-        console.error(`[${extensionDisplayName}] Failed to load settings UI:`, error);
-    }
-    
-    // Wait a bit for ST to load UI elements
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    // Set up components
-    addLanternButton();
-    addExtensionsMenuButton();
-    createSidebar();
-    setupEventListeners();
     setupHideUnhideObserver();
-    
-    log("Initialization complete");
-}
+    updateCounter();
 
-// Register the extension
+    console.log(`[${MODULE_NAME}] Extension loaded`);
+};
+
+// Initialize when ready
 jQuery(async () => {
     await init();
 });
