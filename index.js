@@ -302,11 +302,7 @@ const init = () => {
         updateBadge(String(data.totalCount));
 
         // Update trigger title
-        if (data.totalCount > 0) {
-            trigger.title = `Hidden Messages: ${data.totalCount}`;
-        } else {
-            trigger.title = 'Hidden Messages Overview';
-        }
+        trigger.title = `Hidden Messages: ${data.totalCount} total`;
     };
 
     /**
@@ -316,11 +312,7 @@ const init = () => {
         const data = getHiddenMessagesData();
         updateBadge(String(data.totalCount));
 
-        if (data.totalCount > 0) {
-            trigger.title = `Hidden Messages: ${data.totalCount}`;
-        } else {
-            trigger.title = 'Hidden Messages Overview';
-        }
+        trigger.title = `Hidden Messages: ${data.totalCount} total`;
 
         if (panel.classList.contains('ctbhmc--isActive')) {
             updatePanel();
